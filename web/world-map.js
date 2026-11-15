@@ -19,41 +19,28 @@
     if(event.layer === imagery) labels.addTo(map);
     else labels.remove();
   });
-  const thermalDate = new Date(Date.now() - 86400000).toISOString().slice(0,10);
-  const thermal = L.tileLayer.wms("https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi", {
-    layers:"MODIS_Terra_Brightness_Temp_Band31_Day", time:thermalDate,
-    format:"image/png", transparent:true, version:"1.1.1", maxNativeZoom:7,
-    maxZoom:18, opacity:0.84, attribution:"Thermal imagery: NASA GIBS"
-  });
-  const thermalStatus = byId("thermalStatus");
-  const toggle = byId("thermalView");
-  toggle.onchange = () => {
-    if(toggle.checked){
-      thermalStatus.textContent = "Loading NASA thermal imagery for " + thermalDate + " UTC.";
-      thermal.addTo(map);
-    } else {
-      thermal.remove();
-      thermalStatus.textContent = "";
-    }
-  };
-  let tileFailed = false;
-  thermal.on("loading", () => { tileFailed = false; });
-  thermal.on("tileerror", () => { tileFailed = true; });
-  thermal.on("load", () => {
-    if(toggle.checked) thermalStatus.textContent = tileFailed
-      ? "Some NASA imagery tiles are unavailable. Disable thermal imagery to see the base map."
-      : "Terra MODIS daytime brightness temperature · " + thermalDate + " UTC. Clear areas may lack coverage. Detection times are shown separately.";
-  });
+  const thermalStatus=byId("thermalStatus");
+  thermalStatus.textContent="Archived fire observations over a current basemap.";
   L.control.layers({"Street map":streets,"Satellite imagery":imagery}).addTo(map);
   const panel=byId("worldMap").closest(".world");
   function expand(on){
     panel.classList.toggle("expanded",on);
     byId("expandMap").setAttribute("aria-pressed",String(on));
     byId("expandMap").textContent=on?"Close expanded map":"Expand map";
-    map.invalidateSize();
+    byId("mapFullscreen").textContent=on?"Exit fullscreen":"Fullscreen";
+    byId("mapFullscreen").setAttribute("aria-pressed",String(on));
+    requestAnimationFrame(()=>map.invalidateSize());
   }
-  byId("expandMap").onclick=()=>expand(!panel.classList.contains("expanded"));
-  document.addEventListener("keydown",e=>{if(e.key==="Escape"&&panel.classList.contains("expanded"))expand(false);});
+  async function toggleFullscreen(){
+    if(document.fullscreenElement===panel){await document.exitFullscreen();return;}
+    if(panel.classList.contains("expanded")){expand(false);return;}
+    expand(true);
+    try{if(panel.requestFullscreen)await panel.requestFullscreen();}catch{/* Expanded layout supports embedded browsers. */}
+  }
+  byId("expandMap").onclick=toggleFullscreen;
+  byId("mapFullscreen").onclick=toggleFullscreen;
+  document.addEventListener("fullscreenchange",()=>expand(document.fullscreenElement===panel));
+  document.addEventListener("keydown",e=>{if(e.key==="Escape"&&panel.classList.contains("expanded")&&!document.fullscreenElement)expand(false);});
   L.control.scale({imperial:false}).addTo(map);
   const fires = L.layerGroup().addTo(map);
   const utc = value => new Date(value).toISOString().slice(0,16).replace("T"," ")+" UTC";
@@ -62,6 +49,7 @@
     return [Math.max(60,b.getWest()),Math.max(23,b.getSouth()),Math.min(79,b.getEast()),Math.min(38,b.getNorth())];
   }
   let selection, selecting=false, anchor, preview;
+  let briefingData=null;
   const report=byId("watchReport"), draw=byId("drawArea");
   const surface=map.getContainer();
   function finishDrawing(){
@@ -109,6 +97,7 @@
     outline(point);
     if(selection)selection.remove();
     selection=preview;
+    briefingData=null;
     preview=null;
     finishDrawing();
     byId("clearArea").hidden=false;
@@ -126,22 +115,7 @@
     const b=selection.getBounds();
     return [b.getWest(),b.getSouth(),b.getEast(),b.getNorth()];
   }
-  function activity(features,partial){
-    const readings=features.map(f=>f.attributes.frp).filter(v=>v!=null && v!=="").map(Number).filter(v=>Number.isFinite(v)&&v>=0).sort((a,b)=>a-b);
-    const scope=selection?"Watch area":"Map view";
-    let result="Too few power readings for outlier screening.";
-    if(!features.length) result="No satellite detections returned.";
-    if(readings.length>=8){
-      const quantile=q=>readings[Math.floor((readings.length-1)*q)];
-      const threshold=quantile(.75)+1.5*(quantile(.75)-quantile(.25));
-      const flagged=readings.filter(v=>v>threshold);
-      result=flagged.length ? "Activity alert: "+flagged.length+" unusually strong readings above "+threshold.toFixed(2)+" MW. Peak "+readings.at(-1)+" MW." : "No unusually strong readings in this sample.";
-    }
-    if(!selecting)report.textContent=scope+" · "+features.length+" detections in 24 h. "+result+
-      (partial?" Latest 2,000 only.":"")+" Satellite screening only; incident confirmation unavailable.";
-  }
   window.fireMap = {bounds, setArea:([w,s,e,n])=>map.fitBounds([[s,w],[n,e]],{maxZoom:16,animate:false})};
-  const feed="https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/Satellite_VIIRS_Thermal_Hotspots_and_Fire_Activity/FeatureServer/0/query";
   let outlineRequest;
   function countryRings(){
     if(!outlineRequest) outlineRequest=fetch("assets/pakistan-boundary.json",{signal:AbortSignal.timeout(12000)})
@@ -182,10 +156,94 @@
       });
     });
   };
-  let generation=0,timer;
+  let generation=0,timer,activeRequest,playTimer,playing=false;
+  const historyCache=new Map();
+  const timeSlider=byId("mapTime"),timeLabel=byId("mapTimeLabel");
+  const briefing=document.createElement("section");
+  briefing.className="area-briefing";
+  briefing.setAttribute("aria-label","Selected area briefing");
+  briefing.setAttribute("aria-live","polite");
+  briefing.hidden=true;
+  byId("watchReport").after(briefing);
+  function renderBriefing(){
+    briefing.hidden=!selection;
+    if(!selection)return;
+    briefing.replaceChildren();
+    const title=document.createElement("h3");title.textContent="Selected area";briefing.append(title);
+    const matches=briefingData?.bbox?.every((value,i)=>Math.abs(value-watchedBounds()[i])<.0001);
+    if(!matches){
+      const note=document.createElement("p");note.textContent="Analyze this selected rectangle to load its historical briefing.";
+      briefing.append(note);return;
+    }
+    const month=selectedMonth()||briefingData.rows.at(-1)?.month;
+    const row=briefingData.rows.find(item=>item.month===month);
+    const previous=month?(Number(month.slice(0,4))-1)+month.slice(4):null;
+    const prior=briefingData.rows.find(item=>item.month===previous);
+    const description=document.createElement("p");
+    description.textContent=(selectedMonth()?"Archive month: ":"Latest historical reference: ")+(month||"Unavailable")+". Monthly values use the local historical archive.";
+    briefing.append(description);
+    const stats=document.createElement("dl");
+    const number=value=>value==null?"Unavailable":value.toLocaleString("en",{maximumFractionDigits:1});
+    const change=row&&!row.partial&&prior&&!prior.partial&&prior.harmonized>0?100*(row.harmonized/prior.harmonized-1):null;
+    const fields=[
+      ["Harmonized fire cell-days",number(row?.harmonized)],
+      ["Same month, previous year",change==null?"Unavailable":(change>0?"+":"")+number(change)+"%"],
+      ["Area held-out annual error",number(briefingData.validation?.loyo_error_pct)+(briefingData.validation?.loyo_error_pct==null?"":"%")],
+      ["Sensor source",row?.source||"Outside selected date range"]
+    ];
+    for(const [label,value] of fields){const item=document.createElement("div"),term=document.createElement("dt"),definition=document.createElement("dd");term.textContent=label;definition.textContent=value;item.append(term,definition);stats.append(item);}
+    briefing.append(stats);
+    const coverage=document.createElement("p");coverage.className="briefing-coverage";
+    coverage.textContent=(row?"Model date availability: "+(row.partial?"partial month":"full calendar month for the selected source")+". ":"Choose a timeline month within the analysis date range. ")+"Error uses "+(briefingData.validation?.years_tested||0)+" held-out years. Cloud-free observation coverage is unavailable; zero detections can include missed fires.";
+    briefing.append(coverage);
+  }
+  document.addEventListener("archive-results",event=>{briefingData=event.detail;renderBriefing();});
+  function updateTimelineControls(){
+    const value=Number(timeSlider.value);
+    timeSlider.style.setProperty("--timeline-progress",(value/Number(timeSlider.max)*100)+"%");
+    byId("mapPrevious").disabled=value===0;
+    byId("mapNext").disabled=value===Number(timeSlider.max);
+  }
+  updateTimelineControls();
+  function stopPlayback(){
+    playing=false;clearTimeout(playTimer);
+    byId("mapPlay").textContent="\u25b6";
+    byId("mapPlay").setAttribute("aria-label","Play timeline");
+    byId("mapPlay").setAttribute("aria-pressed","false");
+  }
+  function advancePlayback(){
+    clearTimeout(playTimer);
+    if(!playing)return;
+    if(Number(timeSlider.value)>=301){stopPlayback();return;}
+    playTimer=setTimeout(()=>{if(playing&&!document.hidden){timeSlider.stepUp();updateTimeline();}else stopPlayback();},1000);
+  }
+  byId("mapPlay").onclick=()=>{
+    if(playing){stopPlayback();return;}
+    playing=true;
+    byId("mapPlay").textContent="\u275a\u275a";
+    byId("mapPlay").setAttribute("aria-label","Pause timeline");
+    byId("mapPlay").setAttribute("aria-pressed","true");
+    if(Number(timeSlider.value)>=301)timeSlider.value="0";
+    updateTimeline();
+  };
+  function selectedMonth(){
+    return new Date(Date.UTC(2000,10+Number(timeSlider.value),1)).toISOString().slice(0,7);
+  }
+  function updateTimeline(){
+    updateTimelineControls();
+    const month=selectedMonth();
+    timeLabel.textContent=new Date(month+"-01T00:00:00Z").toLocaleDateString("en",{month:"long",year:"numeric",timeZone:"UTC"});
+    timeSlider.setAttribute("aria-valuetext",timeLabel.textContent);
+    panel.querySelector(".world-head p").textContent="Archived fire observations / "+timeLabel.textContent;
+    panel.querySelectorAll(".fire-key > span").forEach(span=>span.hidden=Boolean(month));
+    panel.querySelector(".fire-key > strong").textContent=month?"Archived detections":"Observation age";
+    schedule();
+  }
+  timeSlider.addEventListener("input",()=>{stopPlayback();updateTimeline();});
+  byId("mapPrevious").onclick=()=>{stopPlayback();timeSlider.stepDown();updateTimeline();};
+  byId("mapNext").onclick=()=>{stopPlayback();timeSlider.stepUp();updateTimeline();};
   async function refresh(ticket){
-    const now=Date.now(), end=Math.floor(now/300000)*300000;
-    const params=new URLSearchParams({f:"json",where:"1=1",geometry:watchedBounds().join(","),geometryType:"esriGeometryEnvelope",inSR:"4326",outSR:"4326",spatialRel:"esriSpatialRelIntersects",time:[end-86400000,end].join(","),outFields:"satellite,acq_time,confidence,frp,daynight",returnGeometry:"true",orderByFields:"acq_time DESC",resultRecordCount:"2000"});
+    const month=selectedMonth();
     try {
       const polygons=await countryRings();
       if(ticket!==generation)return;
@@ -198,13 +256,25 @@
         report.textContent="Fire analysis is available inside Pakistan.";
         return;
       }
-      params.set("geometry",[Math.max(west,60),Math.max(south,23),Math.min(east,79),Math.min(north,38)].join(","));
-      const response=await fetch(feed+"?"+params,{signal:AbortSignal.timeout(20000)});
-      const data=await response.json();
-      if(!response.ok || !Array.isArray(data.features))throw Error();
+      const historical=new URLSearchParams({month:month||"",west:Math.max(west,60),south:Math.max(south,23),east:Math.min(east,79),north:Math.min(north,38)});
+      const url="/api/map/history?"+historical;
+      let data=month?historyCache.get(url):null;
+      if(!data){
+        const controller=new AbortController();activeRequest=controller;
+        const timeout=setTimeout(()=>controller.abort(),60000);
+        try{
+          const response=await fetch(url,{signal:controller.signal});
+          data=await response.json();
+          if(!response.ok || !Array.isArray(data.features))throw Error();
+        }finally{clearTimeout(timeout);}
+        if(month){
+          if(historyCache.size>=18)historyCache.delete(historyCache.keys().next().value);
+          historyCache.set(url,data);
+        }
+      }
       data.features=data.features.filter(({geometry:g})=>polygons.some(([outer,...holes])=>
         inRing(g.x,g.y,outer) && !holes.some(r=>inRing(g.x,g.y,r))));
-      const source="NASA FIRMS via Esri · Pakistan";
+      const source="NASA FIRMS archive / Pakistan";
       if(ticket!==generation)return;
       fires.clearLayers();
       byId("provider").textContent=source;
@@ -212,15 +282,15 @@
       let strongest = null;
       for(const {geometry,attributes} of data.features){
         const popup=document.createElement("div");
-        const hours=Math.max(0,(now-attributes.acq_time)/3600000);
-        const color=hours<3?"#ff354e":hours<12?"#ff871c":"#ffd342";
+        const color="#ff871c";
         const power=attributes.frp==null||attributes.frp===""?null:Number(attributes.frp);
-        const radius=Number.isFinite(power)?Math.min(10,3+Math.sqrt(Math.max(0,power))*.45):4;
+        const baseRadius=Number.isFinite(power)?Math.min(10,3+Math.sqrt(Math.max(0,power))*.45):4;
+        const radius=baseRadius*Math.min(1,Math.max(.28,(map.getZoom()-3)/8));
         const title=document.createElement("strong");
         title.textContent="Thermal hotspot";
         popup.append(title);
         const details=[
-          ["Observed",utc(attributes.acq_time)],["Satellite",attributes.satellite],
+          ["Observed",attributes.observation_date||utc(attributes.acq_time)],["Satellite",attributes.satellite],
           ["Detection confidence",({h:"High",n:"Nominal",l:"Low"})[attributes.confidence]||attributes.confidence],
           ["Radiative power",Number.isFinite(power)?power+" MW":"Unavailable"],
           ["Overpass",({D:"Day",N:"Night"})[attributes.daynight]||attributes.daynight||"Unavailable"],
@@ -229,8 +299,8 @@
           const line=document.createElement("div");line.textContent=label+" · "+value;popup.append(line);
         }
         const point = [geometry.y, geometry.x];
-        L.circleMarker(point,{radius:radius*1.8,stroke:false,fillColor:color,fillOpacity:.23,interactive:false}).addTo(fires);
-        const marker=L.circleMarker(point,{radius:radius+1,stroke:false,fillColor:color,fillOpacity:.83})
+        L.circleMarker(point,{radius:radius*1.8,stroke:false,fillColor:color,fillOpacity:.08,interactive:false}).addTo(fires);
+        const marker=L.circleMarker(point,{radius:radius+1,stroke:false,fillColor:color,fillOpacity:.5})
           .bindPopup(popup,{autoPan:false}).addTo(fires);
         if(Number.isFinite(power) && (!strongest || power > strongest.power)) strongest = {power,marker};
       }
@@ -240,26 +310,39 @@
         inspect.textContent = "Inspect strongest signal · " + strongest.power + " MW";
         inspect.onclick = () => strongest.marker.openPopup();
       }
-      activity(data.features,data.exceededTransferLimit);
+      if(month)report.textContent=timeLabel.textContent+" · "+data.total.toLocaleString()+" archived vegetation fire detections in this area. These are satellite observations; incident confirmation is unavailable.";
+
 
       const count=data.features.length;
-      status.textContent=(data.exceededTransferLimit?""+count+" Pakistan detections in a capped regional sample. Zoom in for more.":count+" detections in view.")+(count?" Latest observation: "+utc(data.features[0].attributes.acq_time)+".":"")+" Checked "+utc(now)+".";
+      status.textContent=(data.exceededTransferLimit?"Showing the 2,000 strongest detections of "+data.total.toLocaleString()+". Zoom in for more detail.":count+" archived detections shown.")+" Month: "+month+". Filtered vegetation fires from the local archive.";
     } catch {
-      if(ticket===generation){report.textContent="Activity unknown. Satellite feed unavailable.";fires.clearLayers();byId("provider").textContent="Feed offline";status.textContent="Detection feed unavailable. Refresh to retry.";}
+      if(ticket===generation){stopPlayback();report.textContent="Historical observations could not load.";fires.clearLayers();byId("provider").textContent="Archive unavailable";status.textContent="Archive unavailable. Refresh to retry.";}
+    } finally {
+      if(ticket===generation){
+        panel.classList.remove("map-loading");
+        byId("worldMap").setAttribute("aria-busy","false");
+        advancePlayback();
+      }
     }
   }
   function schedule(){
     clearTimeout(timer);
+    clearTimeout(playTimer);
+    renderBriefing();
+    activeRequest?.abort();
+    panel.classList.add("map-loading");
+    byId("worldMap").setAttribute("aria-busy","true");
 
-    if(!selecting)report.textContent="Checking satellite activity...";
+    if(!selecting)report.textContent="Reading archived observations...";
     const ticket=++generation;
     byId("inspectPeak").hidden=true; byId("provider").textContent="Checking source...";
-    status.textContent="Checking recent detections in this area...";
-    timer=setTimeout(()=>refresh(ticket),300);
+    status.textContent="Loading "+selectedMonth()+" observations...";
+    timer=setTimeout(()=>refresh(ticket),80);
   }
   map.on("moveend",()=>{if(!selection && !selecting)schedule();});
   byId("refreshLive").onclick=schedule;
-  setInterval(()=>{if(!document.hidden)schedule();},300000);
+  document.addEventListener("visibilitychange",()=>{if(document.hidden)stopPlayback();});
+  updateTimeline();
   let searchId=0;
   byId("placeForm").onsubmit=async event=>{
     event.preventDefault();

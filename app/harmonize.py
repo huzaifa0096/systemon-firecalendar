@@ -9,7 +9,6 @@ import pandas as pd
 from scripts.build_parquet import SENSORS, ROOT
 
 MONTHS = pd.period_range("2000-11", "2025-12", freq="M")
-DEFAULTS = pd.Series([2.80, 2.65, 2.90, 3.11, 3.98, 6.78, 5.38, 3.67, 6.74, 5.86, 5.04, 4.04], index=range(1, 13))
 LOCK = Lock()
 
 
@@ -17,9 +16,8 @@ LOCK = Lock()
 def archive():
     parquet = ROOT / "data/processed/hotspots.parquet"
     if parquet.exists():
-        import duckdb
-        with duckdb.connect() as con:
-            points = con.execute("select * from read_parquet(?) where type=0 and conf_ok", [str(parquet)]).df()
+        points = pd.read_parquet(parquet)
+        points = points.loc[points.type.eq(0) & points.conf_ok]
         points["date"] = pd.to_datetime(points.date)
     else:
         frames = []
@@ -46,65 +44,105 @@ def selection(box):
     return data.loc[data.lon.between(w,e) & data.lat.between(s,n)]
 
 
-def counts(points, index):
-    modis = points[points.sensor == "MODIS"]
-    viirs = points[points.sensor == "VIIRS_SNPP"].drop_duplicates(["date","cell"])
-    return pd.DataFrame({"modis":modis.groupby("period").size(), "viirs":viirs.groupby("period").size()}).reindex(index).fillna(0).astype(int)
-
-
-def ratios(overlap):
-    ratio = overlap.viirs / overlap.modis
-    by_month = ratio.groupby(ratio.index.month)
-    fitted = by_month.median().where(by_month.size() >= 5).reindex(DEFAULTS.index)
-    return fitted.fillna(DEFAULTS), fitted.notna()
+@lru_cache(maxsize=1)
+def engine():
+    from .calibration import Engine
+    return Engine()
 
 
 @lru_cache(maxsize=24)
 def model(box):
-    data = selection(box)
-    series = counts(data, MONTHS)
-    overlap = series[(series.index.year >= 2012) & series.modis.gt(0)]
-    k, fitted = ratios(overlap)
-    series["estimate"] = np.where(series.index.year < 2012, series.modis * series.index.month.map(k), series.viirs)
-    normal = series.loc["2001":"2024","estimate"].groupby(lambda p:p.month).median().round()
-    errors = []
-    for year, test in overlap.groupby(overlap.index.year):
-        coeff, _ = ratios(overlap[overlap.index.year != year])
-        if test.viirs.sum():
-            errors.append((test.modis * test.index.month.map(coeff) - test.viirs).abs().sum() / test.viirs.sum())
-    r = overlap.modis.corr(overlap.viirs) if len(overlap)>1 and overlap.min().ne(overlap.max()).all() else None
-    return series, k, fitted, normal, {"r": None if pd.isna(r) else round(r,3), "loyo_error_pct":round(100*np.mean(errors),1) if errors else None}, len(data)
+    from .calibration import anomalies
+    with LOCK:
+        eng = engine()
+    area = eng.area(box)
+    result = eng.series(area)
+    complete = np.isfinite(result["H"]).all(axis=1)
+    pct, rank, med = anomalies(result["H"], complete)
+    validation = result["validation"].get("MODIS", {})
+    ours = validation.get("ours", {})
+    result.update(anomaly=pct, percentile=rank, median=med)
+    result["validation_summary"] = {
+        "r": ours.get("monthly_r"),
+        "loyo_error_pct": ours.get("annual_error_pct_median"),
+        "monthly_error_pct": ours.get("monthly_error_pct_median"),
+        "years_tested": ours.get("years_tested", 0),
+        "baseline": validation.get("baseline", {}),
+        "metric": "Median absolute annual error in held-out years",
+        "units": "VIIRS-equivalent fire cell-days",
+    }
+    return result
 
 
 def calendar(box, start, end):
-    series,k,fitted,normal,validation,n = model(box)
-    selected = series.loc[str(start)[:7]:str(end)[:7]].copy()
+    from .calibration import LABEL
+    result = model(box)
+    eng = engine()
+    periods = pd.period_range(str(start)[:7], str(end)[:7], freq="M")
     partial = set()
     if start.day != 1:
-        partial.add(selected.index[0])
-    if end.day != selected.index[-1].days_in_month:
-        partial.add(selected.index[-1])
+        partial.add(periods[0])
+    if end.day != periods[-1].days_in_month:
+        partial.add(periods[-1])
+    adjusted = None
     if partial:
-        data = selection(box)
-        actual = counts(data[data.date.between(str(start),str(end))], selected.index)
-        for period in partial:
-            m,v = actual.loc[period]
-            selected.loc[period] = [m,v,m*k[period.month] if period.year<2012 else v]
-    rows=[]
-    for p,row in selected.iterrows():
-        median = int(normal[p.month])
-        rows.append(dict(month=str(p),year=p.year,mon=p.month,modis=int(row.modis),viirs=int(row.viirs) if p.year>=2012 else None,
-                         harmonized=int(np.rint(row.estimate)),source="MODIS × k" if p.year<2012 else "VIIRS S-NPP",
-                         median_2001_2024=median,partial=p in partial,
-                         anomaly_pct=round((row.estimate/median-1)*100,1) if median and p not in partial else None))
-    return dict(rows=rows,bbox=box,k=k.to_dict(),k_source="bbox" if fitted.all() else "mixed" if fitted.any() else "default",
-                climatology=normal.to_dict(),validation=validation,archive_detections=n)
+        w, s, e, n = box
+        cd = eng.cd
+        selected = cd[cd.lon.between(w, e) & cd.lat.between(s, n)
+                      & cd.date.between(pd.Timestamp(start), pd.Timestamp(end))]
+        adjusted = eng.series(eng.dense(selected))
+    rows = []
+    for p in periods:
+        yi, mi = p.year - int(eng.years[0]), p.month - 1
+        values = adjusted if p in partial else result
+        value = values["H"][yi, mi]
+        if not np.isfinite(value):
+            continue
+        src = result["src"][yi, mi]
+        def number(v):
+            return round(float(v), 1) if np.isfinite(v) else None
+        rows.append(dict(
+            month=str(p), year=p.year, mon=p.month,
+            modis=number(values["raw"]["MODIS"][yi, mi]),
+            viirs=number(values["raw"]["SNPP"][yi, mi]) if eng.coverage["SNPP"][yi, mi] else None,
+            harmonized=round(float(value), 1), source=LABEL.get(src, src),
+            median_2001_2024=number(result["median"][yi, mi]),
+            baseline_median=number(result["median"][yi, mi]),
+            lower=number(values["lo"][yi, mi]), upper=number(values["hi"][yi, mi]),
+            partial=p in partial,
+            anomaly_pct=number(result["anomaly"][yi, mi]) if p not in partial else None,
+            percentile=number(result["percentile"][yi, mi]) if p not in partial else None,
+        ))
+    complete = np.isfinite(result["H"]).all(axis=1)
+    normal = np.nanmedian(result["H"][complete], axis=0)
+    return dict(rows=rows, bbox=box, k=eng.k_region.get("MODIS", np.zeros(12)).tolist(),
+                k_source="local spatial calibration", climatology={m+1: float(v) for m,v in enumerate(normal)},
+                validation=result["validation_summary"],
+                units="VIIRS-equivalent fire cell-days", baseline="Same calendar month in other complete years",
+                archive_detections=len(selection(box)))
 
 
 def complete_years(start,end,months):
     return [y for y in range(start.year,end.year+1)
             if pd.Period(year=y,month=min(months),freq="M").start_time.date()>=start
             and pd.Period(year=y,month=max(months),freq="M").end_time.date()<=end]
+
+
+@lru_cache(maxsize=48)
+def seasonal_error(box, months):
+    eng = engine()
+    area = eng.area(box)
+    errors = []
+    mask = eng.overlap_mask("MODIS")
+    indices = np.array(months) - 1
+    for yi, coefficients in eng.k_loyo.get("MODIS", {}).items():
+        if not mask[yi, indices].all():
+            continue
+        observed = area["SNPP"]["n"][:, yi, indices].sum()
+        predicted = (area["MODIS"]["n"][:, yi] * coefficients)[:, indices].sum()
+        if observed > 0:
+            errors.append(abs(predicted - observed) / observed * 100)
+    return round(float(np.median(errors)), 1) if errors else None
 
 
 @lru_cache(maxsize=48)
@@ -140,22 +178,27 @@ def trust(box,start,end,months):
 
 
 def policy(box,start,end,months,year,window):
-    series,*_ = model(box)
-    season=series[series.index.month.isin(months)].estimate
+    result = calendar(box, start, end)
+    series = pd.DataFrame(result["rows"])
+    series.index = pd.PeriodIndex(series.month, freq="M")
+    season = series.loc[series.mon.isin(months), "harmonized"]
     totals=season.groupby(season.index.year).sum()
     complete=complete_years(start,end,months)
     before=[y for y in complete if year-window<=y<year]
     after=[y for y in complete if year<=y<year+window]
     base=float(totals.loc[before].mean()) if before else None
     post=float(totals.loc[after].mean()) if after else None
-    historical=float(totals.loc[2001:2024].median())
+    full = model(box)["H"][:, np.array(months) - 1]
+    valid_seasons = np.isfinite(full).all(axis=1)
+    historical=float(np.median(full[valid_seasons].sum(axis=1))) if valid_seasons.any() else None
+    uncertainty = seasonal_error(box, months)
     change=100*(post/base-1) if base and post is not None else None
     evidence=trust(box,max(start,pd.Timestamp(year=year,month=1,day=1).date()),min(end,pd.Timestamp(year=year+window-1,month=12,day=31).date()),months)
     verdict="Insufficient data"
-    if len(before)==window and len(after)==window and change is not None and evidence["score"]!="Insufficient data":
+    if len(before)==window and len(after)==window and change is not None and evidence["score"]!="Insufficient data" and uncertainty is not None:
         verdict="Within reference error"
-        if abs(change)>15.8:
+        if abs(change)>uncertainty:
             verdict=("Observed increase" if change>0 else "Observed reduction") if evidence["score"]=="High" else "Weak evidence"
     return dict(before_years=before,after_years=after,before_mean=base,after_mean=post,change_pct=change,
                 vs_median_pct=100*(post/historical-1) if historical and post is not None else None,
-                uncertainty_pct=15.8,trust=evidence,verdict=verdict)
+                uncertainty_pct=uncertainty,trust=evidence,verdict=verdict)

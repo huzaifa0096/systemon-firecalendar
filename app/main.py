@@ -3,6 +3,7 @@ from datetime import date
 from pathlib import Path
 import csv
 import io
+import math
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
@@ -30,14 +31,18 @@ def select(start: str, end: str):
 
 @app.get("/api/pakistan/calendar")
 def calendar(start: str = "2000-11", end: str = "2025-12"):
-    return {"region": "Pakistan", "rows": select(start, end)}
+    select(start, end)
+    first = date.fromisoformat(start + "-01")
+    import calendar as dates
+    last = date.fromisoformat(end + "-" + str(dates.monthrange(int(end[:4]), int(end[5:]))[1]))
+    return {"region": "Pakistan", **science.calendar((60,23,79,38), first, last)}
 
 
 @app.get("/api/pakistan/calendar.csv")
 def download(start: str = "2000-11", end: str = "2025-12"):
-    rows = select(start, end)
+    rows = calendar(start, end)["rows"]
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=MONTHS[0].keys())
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
     writer.writeheader()
     writer.writerows(rows)
     return Response(output.getvalue(), media_type="text/csv", headers={
@@ -86,7 +91,7 @@ def area(west:float=69.3,south:float=27.7,east:float=75.4,north:float=34.0,
 def season(months:str="10,11"):
     try:
         values=tuple(sorted(set(int(x) for x in months.split(","))))
-        if not all(1<=m<=12 for m in values):
+        if not values or not all(1<=m<=12 for m in values):
             raise ValueError
         return values
     except ValueError:
@@ -122,7 +127,7 @@ def region_policy(view=Depends(area),months=Depends(season),policy_year:int=Quer
 def regional_csv(view=Depends(area)):
     rows=science.calendar(*view)["rows"]
     output=io.StringIO()
-    writer=csv.DictWriter(output,fieldnames=rows[0].keys())
+    writer=csv.DictWriter(output,fieldnames=rows[0].keys() if rows else ["month", "harmonized", "source"])
     writer.writeheader()
     writer.writerows(rows)
     return Response(output.getvalue(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=calendar.csv"})
@@ -139,6 +144,31 @@ def hotspots(view=Depends(area)):
         for i in range(0,len(data),10000):
             yield data.iloc[i:i+10000].to_csv(index=False,header=False)
     return StreamingResponse(chunks(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=hotspots.csv"})
+
+
+@app.get("/api/map/history")
+def map_history(month: str, west: float = 60, south: float = 23,
+                east: float = 79, north: float = 38):
+    import calendar as dates
+    select(month, month)
+    start = date.fromisoformat(month + "-01")
+    end = date(start.year, start.month, dates.monthrange(start.year, start.month)[1])
+    box, _, _ = area(west, south, east, north, start, end)
+    points = science.selection(box)
+    points = points.loc[points.date.between(str(start), str(end))]
+    total = len(points)
+    sample = points.sort_values("frp", ascending=False, na_position="last").head(2000)
+    features = []
+    for row in sample.itertuples():
+        power = float(row.frp)
+        features.append({"geometry": {"x": float(row.lon), "y": float(row.lat)},
+                         "attributes": {"acq_time": int(row.date.timestamp() * 1000),
+                                        "observation_date": str(row.date.date()),
+                                        "satellite": str(row.satellite), "confidence": str(row.confidence),
+                                        "frp": power if math.isfinite(power) else None,
+                                        "daynight": str(row.daynight)}})
+    return {"features": features, "total": total, "month": month,
+            "exceededTransferLimit": total > len(features)}
 
 
 app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")

@@ -3,7 +3,7 @@ const form = el("filters");
 const coordinateNames = ["west", "south", "east", "north"];
 const regions = {Pakistan:[60,23,79,38], Punjab:[69.3,27.7,75.4,34], Sindh:[66.6,23.6,71.2,28.6]};
 const months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
-const colors = ["#f2f4f5","#e4e8eb","#ced6dc","#b0bec8","#889ba9","#586e7e","#384e5d","#203440"];
+const colors = ["#fff7ed","#ffedd5","#fed7aa","#fdba74","#fb923c","#f97316","#ea580c","#9a3412"];
 const fmt = n => n == null ? "—" : n.toLocaleString("en",{maximumFractionDigits:1});
 const percent = n => n == null ? "Unavailable" : (n>0?"+":"")+fmt(n)+"%";
 const monthName = r => months[r.mon-1]+" "+r.year;
@@ -99,16 +99,16 @@ function renderCalendar(data){
   for(const r of rows){
     const b=document.createElement("button");
     const level=Math.min(7,Math.floor(8*r.harmonized/Math.max(1,peak.harmonized)));
-    b.style.background=colors[level];b.style.color=level<5?"#17212a":"#fff";
+    b.style.background=colors[level];b.style.color=level<7?"#000":"#fff";
     b.textContent=fmt(r.harmonized);
-    const detail="MODIS "+fmt(r.modis)+" · VIIRS "+fmt(r.viirs)+" · "+monthName(r)+" · "+b.textContent+" hotspots · "+percent(r.anomaly_pct)+" vs. historical median · "+r.source+(r.partial?" · Partial month":"");
+    const detail="MODIS "+fmt(r.modis)+" · VIIRS "+fmt(r.viirs)+" · "+monthName(r)+" · "+b.textContent+" fire cell-days · "+percent(r.anomaly_pct)+" vs. historical median · "+r.source+(r.partial?" · Partial month":"");
     b.setAttribute("aria-label",detail);
     b.onclick=()=>{body.querySelector('button[aria-pressed="true"]')?.setAttribute("aria-pressed","false"); b.setAttribute("aria-pressed","true"); el("detail").textContent=detail;};
     cells.get(r.year*12+r.mon).replaceChildren(b);
     if(r===peak)b.click();
   }
   el("year").replaceChildren(...years.map(y=>new Option(y,y)));anomalies();
-  el("validation").textContent="Validation for this area: monthly correlation "+(data.validation.r??"unavailable")+" · held-out error "+fmt(data.validation.loyo_error_pct)+"% · ratio source: "+data.k_source+".";
+  el("validation").textContent="Validation for this area: monthly correlation "+(data.validation.r??"unavailable")+" · median annual held-out error "+fmt(data.validation.loyo_error_pct)+"% · ratio source: "+data.k_source+". Same-unit national baseline annual error: "+fmt(data.validation.baseline?.annual_error_pct_median)+"%. Held-out years: "+fmt(data.validation.years_tested)+".";
 }
 function anomalies(){
   const list=rows.filter(r=>r.year===Number(el("year").value));
@@ -143,7 +143,7 @@ async function compare(event){
   el("verdict").textContent="Comparing complete seasons…";
   try{
     const p=await api("policy_check",q);if(current!==comparison)return;
-    el("verdict").innerHTML="<h4>"+p.verdict+"</h4><p>Before ("+(p.before_years.join(", ")||"none")+") · "+fmt(p.before_mean)+" average seasonal hotspots<br>After ("+(p.after_years.join(", ")||"none")+") · "+fmt(p.after_mean)+" average seasonal hotspots</p><p>Observed change: "+percent(p.change_pct)+" · Against historical median: "+percent(p.vs_median_pct)+"<br>National reference error: 15.8% · After-period trust: "+p.trust.score+"</p>"+p.trust.flags.map(f=>"<p>"+f.detail+"</p>").join("");
+    el("verdict").innerHTML="<h4>"+p.verdict+"</h4><p>Before ("+(p.before_years.join(", ")||"none")+") · "+fmt(p.before_mean)+" average seasonal fire cell-days<br>After ("+(p.after_years.join(", ")||"none")+") · "+fmt(p.after_mean)+" average seasonal fire cell-days</p><p>Observed change: "+percent(p.change_pct)+" · Against historical median: "+percent(p.vs_median_pct)+"<br>Area seasonal held-out error: "+fmt(p.uncertainty_pct)+"% · After-period trust: "+p.trust.score+"</p>"+p.trust.flags.map(f=>"<p>"+f.detail+"</p>").join("");
     const selectedMonths = q.get("months").split(",").map(Number);
     const expected = Number(q.get("years"));
     const periods = [p.before_years,p.after_years].map(years =>
@@ -195,7 +195,7 @@ async function compare(event){
       const scale=Math.max(p.before_mean,p.after_mean,1);
       for(const [label,value] of [["Before",p.before_mean],["After",p.after_mean]]){
         const line=document.createElement("div");line.className="compare-line";
-        line.textContent=label+" · "+fmt(value)+" hotspots per season";
+        line.textContent=label+" · "+fmt(value)+" fire cell-days per season";
         const bar=document.createElement("i");bar.style.width=(100*value/scale)+"%";
         line.append(bar);el("verdict").append(line);
       }
@@ -216,8 +216,9 @@ async function load(event){
     if(current!==revision)return;
     el("areaName").textContent=region;
     el("dates").textContent=q.get("start")+" — "+q.get("end");
-    if(!data.archive_detections){el("status").textContent="No archived detections in this area. Select a rectangle within the Pakistan record.";return;}
+    if(!data.archive_detections || !data.rows.length){el("status").textContent="No archived detections in this area. Select a rectangle within the Pakistan record.";return;}
     renderCalendar(data);renderTrust(evidence);
+    document.dispatchEvent(new CustomEvent("archive-results",{detail:data}));
     el("download").href="/api/calendar.csv?"+q;el("raw").href="/api/hotspots.csv?"+q;
     activeQuery=q;el("results").hidden=false;el("status").textContent=data.rows.length+" months · "+(region==="Punjab"||region==="Sindh"?"Approximate province bounds":"Pakistan archive");
     compare();
@@ -240,7 +241,7 @@ function prepareChartExport(){
   ctx.fillStyle="#203440";ctx.font="600 23px system-ui";
   ctx.fillText("FireCalendar  /  "+el("areaName").textContent,24,34);
   ctx.font="14px system-ui";
-  ctx.fillText("Harmonized monthly hotspots   |   "+el("dates").textContent,24,58);
+  ctx.fillText("Harmonized monthly fire cell-days   |   "+el("dates").textContent,24,58);
   ctx.fillText(coordinateNames.map(n=>n+" "+Number(activeQuery.get(n)).toFixed(4)).join("   "),24,80);
   const peak=Math.max(...rows.map(row=>row.harmonized),1);
   ctx.textAlign="center";
@@ -250,7 +251,7 @@ function prepareChartExport(){
     const x=80+(row.mon-1)*72,y=114+years.indexOf(row.year)*30;
     const level=Math.min(7,Math.floor(8*row.harmonized/peak));
     ctx.fillStyle=colors[level];ctx.fillRect(x,y,70,28);
-    ctx.fillStyle=level<5?"#17212a":"#fff";ctx.fillText(fmt(row.harmonized),x+35,y+19);
+    ctx.fillStyle=level<7?"#000":"#fff";ctx.fillText(fmt(row.harmonized),x+35,y+19);
   }
   ctx.textAlign="left";ctx.fillStyle="#384e5d";
   ctx.fillText("NASA FIRMS · MODIS / VIIRS · Blank cells are outside the selected record.",24,height-18);

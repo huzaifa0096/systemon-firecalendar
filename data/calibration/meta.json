@@ -1,0 +1,31 @@
+{
+  "platforms": {
+    "Aqua": {
+      "first": "2002-07-06",
+      "last": "2025-12-31",
+      "detections": 118317
+    },
+    "N20": {
+      "first": "2018-04-01",
+      "last": "2025-12-31",
+      "detections": 393820
+    },
+    "SNPP": {
+      "first": "2012-01-20",
+      "last": "2025-12-31",
+      "detections": 664597
+    },
+    "Terra": {
+      "first": "2000-11-01",
+      "last": "2025-12-30",
+      "detections": 105817
+    }
+  },
+  "celldays": {
+    "SNPP": 554704,
+    "N20": 331609,
+    "MODIS": 219898,
+    "TERRA": 104108
+  },
+  "fine_grid_deg": 0.01
+}
